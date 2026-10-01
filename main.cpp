@@ -499,11 +499,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"ChannelMixerTrayMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    SetProcessDPIAware();
     g_inst = hInst;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX ic = {sizeof(ic), ICC_BAR_CLASSES};
@@ -552,3 +553,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     if (mtx) CloseHandle(mtx);
     return 0;
 }
+
+// ---------------------------------------------------------------- MinGW entry point wrapper
+#if defined(__GNUC__) && !defined(WINMAIN_WRAPPER_DEFINED)
+#define WINMAIN_WRAPPER_DEFINED
+extern "C" int main(int argc, char* argv[]) {
+    return wWinMain(GetModuleHandleW(NULL), NULL, GetCommandLineW(), SW_SHOWNORMAL);
+}
+#endif
