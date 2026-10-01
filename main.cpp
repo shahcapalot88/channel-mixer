@@ -32,7 +32,7 @@
 #pragma comment(lib, "ole32.lib")
 #endif
 
-// Dynamic DWM API typedef for blur/acrylic rounded backdrop support if needed
+// Dynamic DWM API typedef for dark theme backdrop support
 typedef HRESULT (WINAPI *pfnDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
 
 // Tiny COM smart pointer
@@ -48,7 +48,7 @@ template <class T> struct ComPtr {
     explicit operator bool() const { return p != nullptr; }
 };
 
-// MinGW / MSVC custom meter interface definition
+// Custom meter interface definition
 struct MeterInfo : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* peak) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* count) = 0;
@@ -94,15 +94,74 @@ static DWORD g_mask = 0;
 static DWORD g_last = 0;
 static float g_chk = 0;
 static HBRUSH g_bgBrush = nullptr;
+static bool g_wasActive = false;
 
 static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
 static const DWORD kExStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
-// Updated channel labels: L, R, C, LFE, SL, SR, RL, RR, etc.
+// Abbreviated speaker labels
 static const wchar_t* kSpkShort[] = {
     L"L",   L"R",   L"C",   L"LFE", L"RL",  L"RR",  L"FLC", L"FRC", L"RC",
     L"SL",  L"SR",  L"TC",  L"TFL", L"TFC", L"TFR", L"TBL", L"TBC", L"TBR"
 };
+
+// Dynamic tray icon generator (creates a colored circle indicator)
+static HICON CreateCircleIcon(COLORREF color)
+{
+    int size = GetSystemMetrics(SM_CXSMICON);
+    if (size <= 0) size = 16;
+    
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HDC hdcMask = CreateCompatibleDC(hdcScreen);
+
+    HBITMAP hbmpColor = CreateCompatibleBitmap(hdcScreen, size, size);
+    HBITMAP hbmpMask = CreateBitmap(size, size, 1, 1, nullptr);
+
+    HGDIOBJ oldColor = SelectObject(hdcMem, hbmpColor);
+    HGDIOBJ oldMask = SelectObject(hdcMask, hbmpMask);
+
+    RECT rc = { 0, 0, size, size };
+    HBRUSH blackBrush = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    FillRect(hdcMem, &rc, blackBrush);
+    
+    HBRUSH whiteBrush = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    FillRect(hdcMask, &rc, whiteBrush);
+
+    HBRUSH hBrush = CreateSolidBrush(color);
+    HGDIOBJ oldBrush = SelectObject(hdcMem, hBrush);
+    HPEN hPen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ oldPen = SelectObject(hdcMem, hPen);
+
+    Ellipse(hdcMem, 1, 1, size - 1, size - 1);
+
+    SelectObject(hdcMask, blackBrush);
+    SelectObject(hdcMask, GetStockObject(BLACK_PEN));
+    Ellipse(hdcMask, 1, 1, size - 1, size - 1);
+
+    SelectObject(hdcMem, oldColor);
+    SelectObject(hdcMem, oldBrush);
+    SelectObject(hdcMem, oldPen);
+    SelectObject(hdcMask, oldMask);
+
+    DeleteObject(hBrush);
+    DeleteObject(hPen);
+    DeleteDC(hdcMem);
+    DeleteDC(hdcMask);
+    ReleaseDC(nullptr, hdcScreen);
+
+    ICONINFO ii = {};
+    ii.fIcon = TRUE;
+    ii.hbmMask = hbmpMask;
+    ii.hbmColor = hbmpColor;
+
+    HICON hIcon = CreateIconIndirect(&ii);
+
+    DeleteObject(hbmpColor);
+    DeleteObject(hbmpMask);
+
+    return hIcon;
+}
 
 // ---------- audio ----------
 static bool Acquire()
@@ -152,7 +211,6 @@ static std::wstring ChannelName(int idx)
         }
     }
     
-    // Fallback labels when mask is not present or channels exceed 18
     static const wchar_t* kFallback[] = { L"L", L"R", L"C", L"LFE", L"SL", L"SR", L"RL", L"RR" };
     if (idx < 8) return kFallback[idx];
 
@@ -224,7 +282,7 @@ static void BuildUI()
         int pct = (int)(v * 100.f + 0.5f);
         SendMessageW(c.slider, TBM_SETPOS, TRUE, 100 - pct);
 
-        c.meter = {x0 + 52, 62, x0 + 52 + METER_W, 62 + METER_H};
+        c.meter = {x0 + 52, 62, x0 + 52 + METER_W, x0 + 52 + METER_W + METER_H};
 
         wchar_t buf[16]; wsprintfW(buf, L"%d%%", pct);
         c.pct = Label(buf, x0, 268, colW, 18, SS_CENTER);
@@ -248,7 +306,6 @@ static void DrawMeter(HDC hdc, const Channel& c)
     HGDIOBJ old = SelectObject(m, bmp);
     SelectObject(m, GetStockObject(DC_BRUSH));
 
-    // Dark meter housing
     SetDCBrushColor(m, RGB(18, 18, 22));
     RECT all = {0, 0, METER_W, METER_H};
     FillRect(m, &all, (HBRUSH)GetStockObject(DC_BRUSH));
@@ -274,11 +331,10 @@ static void OnTick()
     float dt = (now - g_last) / 1000.f;
     g_last = now;
 
-    if ((g_chk += dt) > 1.f) {
-        g_chk = 0;
-        std::wstring oldId = g_devId; int oldN = g_n;
-        if (!Acquire() || g_devId != oldId || g_n != oldN) { BuildUI(); return; }
+    if (!g_meter) {
+        Acquire();
     }
+
     if (!g_meter) return;
 
     float peaks[32] = {};
@@ -287,20 +343,47 @@ static void OnTick()
     if (cnt > 32) cnt = 32;
     if (cnt) g_meter->GetChannelsPeakValues(cnt, peaks);
 
-    for (size_t i = 0; i < g_ch.size(); i++) {
-        Channel& c = g_ch[i];
-        float p = i < cnt ? peaks[i] : 0.f;
-        float db = p > 0 ? 20.f * std::log10(p) : MIN_DB;
-        float target = std::min(1.f, std::max(0.f, (db - MIN_DB) / -MIN_DB));
+    bool hasActivity = false;
+    for (UINT i = 0; i < cnt; i++) {
+        if (peaks[i] > 0.001f) {
+            hasActivity = true;
+            break;
+        }
+    }
 
-        c.level = target > c.level ? target : std::max(target, c.level - dt * 0.8f);
-        if (c.level >= c.hold) { c.hold = c.level; c.holdTimer = 0.8f; }
-        else if ((c.holdTimer -= dt) < 0) c.hold = std::max(c.level, c.hold - dt * 0.5f);
+    // Toggle tray icon color based on audio activity
+    if (hasActivity != g_wasActive) {
+        g_wasActive = hasActivity;
 
-        int lit = (int)(c.level * SEGS + 0.5f), hs = (int)(c.hold * SEGS + 0.5f) - 1;
-        if (lit != c.lit || hs != c.holdSeg) {
-            c.lit = lit; c.holdSeg = hs;
-            InvalidateRect(g_wnd, &c.meter, FALSE);
+        COLORREF greenBright = RGB(50, 230, 80);
+        COLORREF greenDimmed = RGB(20, 60, 30);
+
+        HICON hNewIcon = CreateCircleIcon(hasActivity ? greenBright : greenDimmed);
+
+        if (g_nid.hIcon) DestroyIcon(g_nid.hIcon);
+        g_nid.hIcon = hNewIcon;
+
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+
+    // Update meter graphics only if panel is currently visible
+    if (IsWindowVisible(g_wnd)) {
+        for (size_t i = 0; i < g_ch.size(); i++) {
+            Channel& c = g_ch[i];
+            float p = i < cnt ? peaks[i] : 0.f;
+
+            float db = p > 0 ? 20.f * std::log10(p) : MIN_DB;
+            float target = std::min(1.f, std::max(0.f, (db - MIN_DB) / -MIN_DB));
+
+            c.level = target > c.level ? target : std::max(target, c.level - dt * 0.8f);
+            if (c.level >= c.hold) { c.hold = c.level; c.holdTimer = 0.8f; }
+            else if ((c.holdTimer -= dt) < 0) c.hold = std::max(c.level, c.hold - dt * 0.5f);
+
+            int lit = (int)(c.level * SEGS + 0.5f), hs = (int)(c.hold * SEGS + 0.5f) - 1;
+            if (lit != c.lit || hs != c.holdSeg) {
+                c.lit = lit; c.holdSeg = hs;
+                InvalidateRect(g_wnd, &c.meter, FALSE);
+            }
         }
     }
 }
@@ -313,7 +396,6 @@ static void ApplyDarkTheme(HWND hwnd)
         auto pDwmSetWindowAttribute = (pfnDwmSetWindowAttribute)GetProcAddress(hUser, "DwmSetWindowAttribute");
         if (pDwmSetWindowAttribute) {
             BOOL useDarkMode = TRUE;
-            // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / Win10 20H1+)
             pDwmSetWindowAttribute(hwnd, 20, &useDarkMode, sizeof(useDarkMode));
         }
     }
@@ -329,15 +411,14 @@ static void ShowPanel()
     SetWindowPos(g_wnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(g_wnd);
     g_last = GetTickCount(); g_chk = 0;
-    SetTimer(g_wnd, ID_TIMER, 33, nullptr);
+    SetTimer(g_wnd, ID_TIMER, 33, nullptr); // High refresh rate for window meters
 }
 
 static void HidePanel()
 {
-    KillTimer(g_wnd, ID_TIMER);
     ShowWindow(g_wnd, SW_HIDE);
     DestroyChildren();
-    g_vol.Reset(); g_meter.Reset(); g_dev.Reset();
+    SetTimer(g_wnd, ID_TIMER, 100, nullptr); // Keep low-frequency timer active for tray icon
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
@@ -408,6 +489,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        KillTimer(h, ID_TIMER);
+        if (g_nid.hIcon) DestroyIcon(g_nid.hIcon);
         if (g_bgBrush) DeleteObject(g_bgBrush);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
@@ -427,7 +510,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     InitCommonControlsEx(&ic);
     g_taskbarMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
-    // Dark background brush matching modern Windows acrylic themes (RGB 32, 32, 38)
     g_bgBrush = CreateSolidBrush(RGB(32, 32, 38));
 
     WNDCLASSW wc = {};
@@ -436,6 +518,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.lpszClassName = L"ChannelMixerWnd";
     wc.hbrBackground = g_bgBrush;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
     RegisterClassW(&wc);
 
     g_wnd = CreateWindowExW(kExStyle, wc.lpszClassName, L"Channel Mixer", kStyle,
@@ -443,16 +526,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     ApplyDarkTheme(g_wnd);
 
+    Acquire(); // Initialize audio interfaces for tray monitoring
+
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_wnd;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    g_nid.hIcon = CreateCircleIcon(RGB(20, 60, 30));
     lstrcpynW(g_nid.szTip, L"Channel Mixer", 128);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    g_last = GetTickCount();
+    SetTimer(g_wnd, ID_TIMER, 100, nullptr); // Start background timer for tray icon updates
 
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
