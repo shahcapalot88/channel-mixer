@@ -32,7 +32,10 @@
 #pragma comment(lib, "ole32.lib")
 #endif
 
-// Tiny COM smart pointer (works on MSVC and MinGW)
+// Dynamic DWM API typedef for blur/acrylic rounded backdrop support if needed
+typedef HRESULT (WINAPI *pfnDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+
+// Tiny COM smart pointer
 template <class T> struct ComPtr {
     T* p = nullptr;
     ComPtr() {}
@@ -45,7 +48,7 @@ template <class T> struct ComPtr {
     explicit operator bool() const { return p != nullptr; }
 };
 
-// MinGW headers don't define the meter interface, so declare it ourselves (same vtable layout as Windows')
+// MinGW / MSVC custom meter interface definition
 struct MeterInfo : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* peak) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* count) = 0;
@@ -53,7 +56,7 @@ struct MeterInfo : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE QueryHardwareSupport(DWORD* mask) = 0;
 };
 
-// GUIDs written out so no extra libraries are needed
+// GUID definitions
 static const GUID kClsidEnum   = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
 static const GUID kIidEnum     = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
 static const GUID kIidVol      = {0x5CDF2C82, 0x841E, 0x4546, {0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A}};
@@ -90,12 +93,16 @@ static int g_n = 0;
 static DWORD g_mask = 0;
 static DWORD g_last = 0;
 static float g_chk = 0;
+static HBRUSH g_bgBrush = nullptr;
+
 static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
 static const DWORD kExStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
-static const wchar_t* kSpk[] = {
-    L"Front L", L"Front R", L"Center", L"LFE", L"Back L", L"Back R", L"FL Ctr", L"FR Ctr", L"Back Ctr",
-    L"Side L", L"Side R", L"Top Ctr", L"Top FL", L"Top FC", L"Top FR", L"Top BL", L"Top BC", L"Top BR"};
+// Updated channel labels: L, R, C, LFE, SL, SR, RL, RR, etc.
+static const wchar_t* kSpkShort[] = {
+    L"L",   L"R",   L"C",   L"LFE", L"RL",  L"RR",  L"FLC", L"FRC", L"RC",
+    L"SL",  L"SR",  L"TC",  L"TFL", L"TFC", L"TFR", L"TBL", L"TBC", L"TBR"
+};
 
 // ---------- audio ----------
 static bool Acquire()
@@ -135,12 +142,21 @@ static bool Acquire()
 
 static std::wstring ChannelName(int idx)
 {
-    if (g_mask) {   // channels are in ascending bit order of the speaker mask
+    if (g_mask) {
         int seen = 0;
-        for (int bit = 0; bit < 18; bit++)
-            if (g_mask & (1u << bit)) { if (seen == idx) return kSpk[bit]; seen++; }
+        for (int bit = 0; bit < 18; bit++) {
+            if (g_mask & (1u << bit)) {
+                if (seen == idx) return kSpkShort[bit];
+                seen++;
+            }
+        }
     }
-    wchar_t b[24]; wsprintfW(b, L"Ch %d", idx + 1); return b;
+    
+    // Fallback labels when mask is not present or channels exceed 18
+    static const wchar_t* kFallback[] = { L"L", L"R", L"C", L"LFE", L"SL", L"SR", L"RL", L"RR" };
+    if (idx < 8) return kFallback[idx];
+
+    wchar_t b[24]; wsprintfW(b, L"Ch%d", idx + 1); return b;
 }
 
 static std::wstring LayoutName()
@@ -152,7 +168,7 @@ static std::wstring LayoutName()
     case 6: return L"5.1";
     case 8: return L"7.1";
     }
-    wchar_t b[24]; wsprintfW(b, L"%d channels", g_n); return b;
+    wchar_t b[24]; wsprintfW(b, L"%d ch", g_n); return b;
 }
 
 // ---------- UI ----------
@@ -206,7 +222,7 @@ static void BuildUI()
         float v = 1.f;
         if (g_vol) g_vol->GetChannelVolumeLevelScalar((UINT)i, &v);
         int pct = (int)(v * 100.f + 0.5f);
-        SendMessageW(c.slider, TBM_SETPOS, TRUE, 100 - pct);   // vertical trackbar: top = min, so invert
+        SendMessageW(c.slider, TBM_SETPOS, TRUE, 100 - pct);
 
         c.meter = {x0 + 52, 62, x0 + 52 + METER_W, 62 + METER_H};
 
@@ -232,14 +248,15 @@ static void DrawMeter(HDC hdc, const Channel& c)
     HGDIOBJ old = SelectObject(m, bmp);
     SelectObject(m, GetStockObject(DC_BRUSH));
 
-    SetDCBrushColor(m, RGB(20, 20, 20));
+    // Dark meter housing
+    SetDCBrushColor(m, RGB(18, 18, 22));
     RECT all = {0, 0, METER_W, METER_H};
     FillRect(m, &all, (HBRUSH)GetStockObject(DC_BRUSH));
 
     float segH = (float)METER_H / SEGS;
     for (int i = 0; i < SEGS; i++) {
         float db = MIN_DB + (i + 1) / (float)SEGS * -MIN_DB;
-        COLORREF col = db > -3 ? RGB(255, 40, 40) : db > -12 ? RGB(255, 200, 0) : RGB(40, 220, 60);
+        COLORREF col = db > -3 ? RGB(255, 60, 60) : db > -12 ? RGB(255, 200, 50) : RGB(50, 220, 100);
         bool on = i < c.lit || i == c.holdSeg;
         SetDCBrushColor(m, on ? col : Dim(col));
         RECT r = {1, (LONG)(METER_H - (i + 1) * segH + 1), METER_W - 1, (LONG)(METER_H - i * segH - 1)};
@@ -257,7 +274,6 @@ static void OnTick()
     float dt = (now - g_last) / 1000.f;
     g_last = now;
 
-    // once a second: did the default device or speaker layout change?
     if ((g_chk += dt) > 1.f) {
         g_chk = 0;
         std::wstring oldId = g_devId; int oldN = g_n;
@@ -282,7 +298,7 @@ static void OnTick()
         else if ((c.holdTimer -= dt) < 0) c.hold = std::max(c.level, c.hold - dt * 0.5f);
 
         int lit = (int)(c.level * SEGS + 0.5f), hs = (int)(c.hold * SEGS + 0.5f) - 1;
-        if (lit != c.lit || hs != c.holdSeg) {   // redraw only when something visible changed
+        if (lit != c.lit || hs != c.holdSeg) {
             c.lit = lit; c.holdSeg = hs;
             InvalidateRect(g_wnd, &c.meter, FALSE);
         }
@@ -290,9 +306,23 @@ static void OnTick()
 }
 
 // ---------- show / hide ----------
+static void ApplyDarkTheme(HWND hwnd)
+{
+    HMODULE hUser = GetModuleHandleW(L"dwmapi.dll");
+    if (hUser) {
+        auto pDwmSetWindowAttribute = (pfnDwmSetWindowAttribute)GetProcAddress(hUser, "DwmSetWindowAttribute");
+        if (pDwmSetWindowAttribute) {
+            BOOL useDarkMode = TRUE;
+            // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / Win10 20H1+)
+            pDwmSetWindowAttribute(hwnd, 20, &useDarkMode, sizeof(useDarkMode));
+        }
+    }
+}
+
 static void ShowPanel()
 {
     BuildUI();
+    ApplyDarkTheme(g_wnd);
     RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     RECT wr; GetWindowRect(g_wnd, &wr);
     int x = wa.right - (wr.right - wr.left) - 12, y = wa.bottom - (wr.bottom - wr.top) - 12;
@@ -308,14 +338,21 @@ static void HidePanel()
     ShowWindow(g_wnd, SW_HIDE);
     DestroyChildren();
     g_vol.Reset(); g_meter.Reset(); g_dev.Reset();
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);   // give memory back to Windows
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    if (msg == g_taskbarMsg) { Shell_NotifyIconW(NIM_ADD, &g_nid); return 0; }   // explorer restarted
+    if (msg == g_taskbarMsg) { Shell_NotifyIconW(NIM_ADD, &g_nid); return 0; }
 
     switch (msg) {
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)wp;
+        SetTextColor(hdcStatic, RGB(235, 235, 240));
+        SetBkMode(hdcStatic, TRANSPARENT);
+        return (LRESULT)g_bgBrush;
+    }
+
     case WM_TRAY:
         if (lp == WM_LBUTTONUP) {
             if (IsWindowVisible(h)) HidePanel(); else ShowPanel();
@@ -366,11 +403,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_CLOSE:       // X button: back to the tray instead of quitting
+    case WM_CLOSE:
         HidePanel();
         return 0;
 
     case WM_DESTROY:
+        if (g_bgBrush) DeleteObject(g_bgBrush);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -381,7 +419,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"ChannelMixerTrayMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;   // already running
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     g_inst = hInst;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -389,16 +427,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     InitCommonControlsEx(&ic);
     g_taskbarMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
+    // Dark background brush matching modern Windows acrylic themes (RGB 32, 32, 38)
+    g_bgBrush = CreateSolidBrush(RGB(32, 32, 38));
+
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"ChannelMixerWnd";
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g_bgBrush;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
     g_wnd = CreateWindowExW(kExStyle, wc.lpszClassName, L"Channel Mixer", kStyle,
                             CW_USEDEFAULT, CW_USEDEFAULT, 400, 380, nullptr, nullptr, hInst, nullptr);
+
+    ApplyDarkTheme(g_wnd);
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_wnd;
@@ -407,7 +450,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                     GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);   // fallback if built without the icon
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     lstrcpynW(g_nid.szTip, L"Channel Mixer", 128);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
